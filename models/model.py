@@ -5,6 +5,12 @@ from flops.flops import get_attn_gflops, get_moe_gflops
 from hardware.gpu import gpu_map
 from kvcache.kvcache import get_kvcache_size
 from layers.attn import create_attention
+from layers.layer_timing import (
+    LayerTiming,
+    apply_kv_prefetch,
+    plot_layer_gantt,
+    save_layer_timings,
+)
 from layers.moe import MoE
 from params.params import get_attn_params_size, get_expert_params_size
 
@@ -14,6 +20,8 @@ class Model:
         self.gpu = gpu_map[args.device_type]
         self.args = args
         self.config = config
+        self.enable_prefetch = getattr(args, "enable_prefetch", False)
+        self.output_dir = getattr(args, "output_dir", "./output")
 
     def print_weights_info(self):
         print("{s:{c}^{n}}".format(s="Model Weights", n=50, c="-"))
@@ -156,6 +164,21 @@ class Model:
         print("{:<40} {:<10.2f}".format("Comm before MoE/FFN (us):", comm_time1 * 1e6))
         print("{:<40} {:<10.2f}".format("Comm after MoE/FFN (us):", comm_time2 * 1e6))
 
+        # Build per-layer timings
+        layer_timings = []
+        for i in range(self.config.num_hidden_layers):
+            lt = LayerTiming(
+                layer_index=i,
+                attn_core_time=attn_core_time,
+                attn_proj_time=attn_other_time,
+                moe_compute_time=moe_time,
+                kv_cache_load_time=0,  # prefill KV is generated, not loaded
+                comm_before_moe=comm_time1,
+                comm_after_moe=comm_time2,
+                is_moe=self.config.is_moe,
+            )
+            layer_timings.append(lt)
+
         num_tokens = self.args.max_prefill_tokens
         if self.args.enable_tbo:
             num_tokens *= 2
@@ -182,6 +205,11 @@ class Model:
                 "Throughput (TGS:tok/GPU/s):", num_tokens / (ttft / 1000)
             )
         )
+
+        # Save and plot layer timings
+        save_layer_timings(layer_timings, self.output_dir, phase="prefill")
+        plot_layer_gantt(layer_timings, self.output_dir, phase="prefill",
+                        enable_prefetch=False)
 
     def decoding(self):
         print("{s:{c}^{n}}".format(s="Decoding", n=50, c="-"))
@@ -212,6 +240,46 @@ class Model:
         print("{:<40} {:<10.2f}".format("Comm before MoE/FFN (us):", comm_time1 * 1e6))
         print("{:<40} {:<10.2f}".format("Comm after MoE/FFN (us):", comm_time2 * 1e6))
 
+        # Estimate KV cache load time per layer for prefetching
+        kv_load_per_layer = (
+            self.kvcache_bytes
+            * self.avg_context_len
+            * self.target_bs
+            / self.config.num_hidden_layers
+            / 1024 / 1024 / 1024
+            / self.gpu.mem_bw
+        )
+
+        # Expert weight load time
+        from params.params import load_moe_weights_time
+        expert_load_time = load_moe_weights_time(
+            self.config, self.args.use_fp8_gemm, self.gpu, self.args.world_size
+        ) if self.config.is_moe else 0.0
+
+        # Build per-layer timings
+        layer_timings = []
+        for i in range(self.config.num_hidden_layers):
+            lt = LayerTiming(
+                layer_index=i,
+                attn_core_time=attn_core_time,
+                attn_proj_time=attn_other_time,
+                moe_compute_time=moe_time,
+                kv_cache_load_time=kv_load_per_layer,
+                expert_weight_load_time=expert_load_time,
+                comm_before_moe=comm_time1,
+                comm_after_moe=comm_time2,
+                is_moe=self.config.is_moe,
+            )
+            layer_timings.append(lt)
+
+        # Apply KV cache prefetching if enabled
+        prefetch_savings = 0.0
+        if self.enable_prefetch:
+            prefetch_savings = apply_kv_prefetch(layer_timings)
+            print("{:<40} {:<10.2f}".format(
+                "KV prefetch savings (us):", prefetch_savings * 1e6
+            ))
+
         num_tokens = self.target_bs
         if self.args.enable_tbo:
             num_tokens *= 2
@@ -228,7 +296,29 @@ class Model:
         tpot *= 1000  # convert to ms
         tpot += 5  # for scheduler
 
+        # Subtract prefetch savings
+        if self.enable_prefetch:
+            prefetch_ms = prefetch_savings * 1000
+            print("{:<40} {:<10.2f}".format("TPOT before prefetch (ms):", tpot))
+            tpot -= prefetch_ms
+            print("{:<40} {:<10.2f}".format("TPOT after prefetch (ms):", tpot))
+
         print("{:<40} {:<10.2f}".format("TPOT (ms):", tpot))
         print("{:<40} {:<10.0f}".format("Throughput (TGS):", num_tokens / tpot * 1000))
         if tpot > self.args.target_tpot:
             print("!Error: TPOT > SLO, need smaller GFLOPs to speedup")
+
+        # Print per-layer breakdown summary
+        print("{s:{c}^{n}}".format(s="Per-Layer Breakdown", n=50, c="-"))
+        print(f"{'Layer':<8} {'Compute(us)':<14} {'I/O(us)':<14} {'Comm(us)':<14} {'Total(us)':<14}")
+        for lt in layer_timings[:5]:  # Show first 5 layers
+            print(f"  L{lt.layer_index:<5} {lt.compute_time*1e6:<14.1f} "
+                  f"{lt.effective_io_time*1e6:<14.1f} {lt.comm_time*1e6:<14.1f} "
+                  f"{lt.total_time*1e6:<14.1f}")
+        if len(layer_timings) > 5:
+            print(f"  ... ({len(layer_timings) - 5} more layers)")
+
+        # Save and plot layer timings
+        save_layer_timings(layer_timings, self.output_dir, phase="decode")
+        plot_layer_gantt(layer_timings, self.output_dir, phase="decode",
+                        enable_prefetch=self.enable_prefetch)

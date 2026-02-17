@@ -14,6 +14,7 @@ def main(args):
     print("{:<40} {:<10}".format("Attn type:", config.attn_type))
     print("{:<40} {:<10}".format("Use FP8 GEMM:", args.use_fp8_gemm))
     print("{:<40} {:<10}".format("Use FP8 KV:", args.use_fp8_kv))
+    print("{:<40} {:<10}".format("KV Prefetch:", args.enable_prefetch))
 
     if config.is_hybrid_linear:
         model = HybridModel(args, config)
@@ -70,6 +71,17 @@ if __name__ == "__main__":
     parser.add_argument("--enable-deepep", action="store_true", help="Enable DeepEP")
     parser.add_argument(
         "--enable-tbo", action="store_true", help="Enable two batch overlap"
+    )
+    parser.add_argument(
+        "--enable-prefetch",
+        action="store_true",
+        help="Enable GPU-initiated KV cache prefetching for next layer",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./output",
+        help="Output directory for layer timing data and plots",
     )
     parser.add_argument(
         "--sm-ratio",
